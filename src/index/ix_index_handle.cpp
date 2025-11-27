@@ -481,8 +481,21 @@ Rid IxIndexHandle::get_rid(const Iid &iid) const {
  * 可用*(int *)key转换回去
  */
 Iid IxIndexHandle::lower_bound(const char *key) {
-
-    return Iid{-1, -1};
+    if (is_empty()) return leaf_end();
+    auto [leaf, _] = find_leaf_page(key, Operation::FIND, nullptr);
+    if (leaf == nullptr) return leaf_end();
+    int pos = leaf->lower_bound(key);
+    if (pos == leaf->get_size()) {
+        page_id_t next = leaf->get_next_leaf();
+        buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+        if (next == IX_LEAF_HEADER_PAGE) {
+            return leaf_end();
+        }
+        return Iid{.page_no = next, .slot_no = 0};
+    }
+    Iid iid = {.page_no = leaf->get_page_no(), .slot_no = pos};
+    buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+    return iid;
 }
 
 /**
@@ -492,8 +505,21 @@ Iid IxIndexHandle::lower_bound(const char *key) {
  * @return Iid
  */
 Iid IxIndexHandle::upper_bound(const char *key) {
-    
-    return Iid{-1, -1};
+    if (is_empty()) return leaf_end();
+    auto [leaf, _] = find_leaf_page(key, Operation::FIND, nullptr);
+    if (leaf == nullptr) return leaf_end();
+    int pos = leaf->upper_bound(key);
+    if (pos == leaf->get_size()) {
+        page_id_t next = leaf->get_next_leaf();
+        buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+        if (next == IX_LEAF_HEADER_PAGE) {
+            return leaf_end();
+        }
+        return Iid{.page_no = next, .slot_no = 0};
+    }
+    Iid iid = {.page_no = leaf->get_page_no(), .slot_no = pos};
+    buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+    return iid;
 }
 
 /**
