@@ -40,7 +40,7 @@ int IxNodeHandle::lower_bound(const char *target) const {
 int IxNodeHandle::upper_bound(const char *target) const {
     // 查找第一个 > target 的key
     int size = page_hdr->num_key;
-    int start = is_leaf_page() ? 0 : 1;  // 内部结点从1开始
+    int start = page_hdr->is_leaf ? 0 : 1;  // 内部结点从1开始
     int key_len = file_hdr->col_tot_len_;
     for (int i = start; i < size; i++) {
         char *cur_key = keys + i * key_len;
