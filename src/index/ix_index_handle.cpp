@@ -197,12 +197,16 @@ IxIndexHandle::IxIndexHandle(DiskManager *disk_manager, BufferPoolManager *buffe
  */
 std::pair<IxNodeHandle *, bool> IxIndexHandle::find_leaf_page(const char *key, Operation operation,
                                                             Transaction *transaction, bool find_first) {
-    // Todo:
-    // 1. 获取根节点
-    // 2. 从根节点开始不断向下查找目标key
-    // 3. 找到包含该key值的叶子结点停止查找，并返回叶子节点
-
-    return std::make_pair(nullptr, false);
+    if (is_empty()) {
+        return std::make_pair(nullptr, false);
+    }
+    IxNodeHandle *node = fetch_node(file_hdr_->root_page_);
+    while (!node->is_leaf_page()) {
+        page_id_t child_no = node->internal_lookup(key);
+        buffer_pool_manager_->unpin_page(node->get_page_id(), false);
+        node = fetch_node(child_no);
+    }
+    return std::make_pair(node, false);
 }
 
 /**
@@ -214,13 +218,17 @@ std::pair<IxNodeHandle *, bool> IxIndexHandle::find_leaf_page(const char *key, O
  * @return bool 返回目标键值对是否存在
  */
 bool IxIndexHandle::get_value(const char *key, std::vector<Rid> *result, Transaction *transaction) {
-    // Todo:
-    // 1. 获取目标key值所在的叶子结点
-    // 2. 在叶子节点中查找目标key值的位置，并读取key对应的rid
-    // 3. 把rid存入result参数中
-    // 提示：使用完buffer_pool提供的page之后，记得unpin page；记得处理并发的上锁
-
-    return false;
+    std::lock_guard<std::mutex> guard(root_latch_);
+    if (is_empty()) return false;
+    auto [leaf, _] = find_leaf_page(key, Operation::FIND, transaction);
+    if (leaf == nullptr) return false;
+    Rid *out = nullptr;
+    bool found = leaf->leaf_lookup(key, &out);
+    if (found) {
+        result->push_back(*out);
+    }
+    buffer_pool_manager_->unpin_page(leaf->get_page_id(), false);
+    return found;
 }
 
 /**
