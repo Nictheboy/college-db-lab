@@ -198,7 +198,34 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
  * @param {Context*} context
  */
 void SmManager::create_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
-    
+    // 校验表是否存在
+    if (!db_.is_table(tab_name)) {
+        throw TableNotFoundError(tab_name);
+    }
+    TabMeta &tab = db_.get_table(tab_name);
+    // 校验索引是否已存在（按字段顺序）
+    if (tab.is_index(col_names)) {
+        throw IndexExistsError(tab_name, col_names);
+    }
+    // 组装索引元数据
+    IndexMeta index_meta;
+    index_meta.tab_name = tab_name;
+    index_meta.col_tot_len = 0;
+    index_meta.col_num = static_cast<int>(col_names.size());
+    index_meta.cols.clear();
+    for (auto &name : col_names) {
+        auto it = tab.get_col(name);
+        index_meta.cols.push_back(*it);
+        index_meta.col_tot_len += it->len;
+        // 标记该列存在索引（供展示）
+        it->index = true;
+    }
+    // 创建索引文件
+    ix_manager_->create_index(tab_name, index_meta.cols);
+    // 记录到表元数据
+    tab.indexes.push_back(index_meta);
+    // 刷盘元数据
+    flush_meta();
 }
 
 /**
