@@ -45,12 +45,78 @@ class SeqScanExecutor : public AbstractExecutor {
         fed_conds_ = conds_;
     }
 
+    size_t tupleLen() const override { return len_; }
+
+    const std::vector<ColMeta> &cols() const override { return cols_; }
+
+    bool is_end() const override { return scan_ == nullptr || scan_->is_end(); }
+
+    ColMeta get_col_offset(const TabCol &target) override {
+        auto it = get_col(cols_, target);
+        return *it;
+    }
+
     /**
      * @brief 构建表迭代器scan_,并开始迭代扫描,直到扫描到第一个满足谓词条件的元组停止,并赋值给rid_
      *
      */
     void beginTuple() override {
-        
+        scan_ = std::make_unique<RmScan>(fh_);
+        // 将scan_移动到第一个满足条件的记录
+        auto satisfy = [&](const Rid &rid) -> bool {
+            auto rec = fh_->get_record(rid, context_);
+            for (auto &cond : fed_conds_) {
+                auto lhs_it = get_col(cols_, cond.lhs_col);
+                char *lhs_ptr = rec->data + lhs_it->offset;
+                char *rhs_ptr = nullptr;
+                ColType type = lhs_it->type;
+                int len = lhs_it->len;
+                if (cond.is_rhs_val) {
+                    rhs_ptr = cond.rhs_val.raw->data;
+                } else {
+                    auto rhs_it = get_col(cols_, cond.rhs_col);
+                    rhs_ptr = rec->data + rhs_it->offset;
+                }
+                int cmp = 0;
+                if (type == TYPE_INT) {
+                    int a = *(int *)lhs_ptr, b = *(int *)rhs_ptr;
+                    cmp = (a < b) ? -1 : ((a > b) ? 1 : 0);
+                } else if (type == TYPE_FLOAT) {
+                    float a = *(float *)lhs_ptr, b = *(float *)rhs_ptr;
+                    cmp = (a < b) ? -1 : ((a > b) ? 1 : 0);
+                } else {
+                    cmp = memcmp(lhs_ptr, rhs_ptr, len);
+                }
+                switch (cond.op) {
+                    case OP_EQ:
+                        if (cmp != 0) return false;
+                        break;
+                    case OP_NE:
+                        if (cmp == 0) return false;
+                        break;
+                    case OP_LT:
+                        if (!(cmp < 0)) return false;
+                        break;
+                    case OP_GT:
+                        if (!(cmp > 0)) return false;
+                        break;
+                    case OP_LE:
+                        if (!(cmp <= 0)) return false;
+                        break;
+                    case OP_GE:
+                        if (!(cmp >= 0)) return false;
+                        break;
+                }
+            }
+            return true;
+        };
+        for (; !scan_->is_end(); scan_->next()) {
+            Rid r = scan_->rid();
+            if (fh_->is_record(r) && satisfy(r)) {
+                rid_ = r;
+                break;
+            }
+        }
     }
 
     /**
@@ -58,7 +124,61 @@ class SeqScanExecutor : public AbstractExecutor {
      *
      */
     void nextTuple() override {
-        
+        if (is_end()) return;
+        auto satisfy = [&](const Rid &rid) -> bool {
+            auto rec = fh_->get_record(rid, context_);
+            for (auto &cond : fed_conds_) {
+                auto lhs_it = get_col(cols_, cond.lhs_col);
+                char *lhs_ptr = rec->data + lhs_it->offset;
+                char *rhs_ptr = nullptr;
+                ColType type = lhs_it->type;
+                int len = lhs_it->len;
+                if (cond.is_rhs_val) {
+                    rhs_ptr = cond.rhs_val.raw->data;
+                } else {
+                    auto rhs_it = get_col(cols_, cond.rhs_col);
+                    rhs_ptr = rec->data + rhs_it->offset;
+                }
+                int cmp = 0;
+                if (type == TYPE_INT) {
+                    int a = *(int *)lhs_ptr, b = *(int *)rhs_ptr;
+                    cmp = (a < b) ? -1 : ((a > b) ? 1 : 0);
+                } else if (type == TYPE_FLOAT) {
+                    float a = *(float *)lhs_ptr, b = *(float *)rhs_ptr;
+                    cmp = (a < b) ? -1 : ((a > b) ? 1 : 0);
+                } else {
+                    cmp = memcmp(lhs_ptr, rhs_ptr, len);
+                }
+                switch (cond.op) {
+                    case OP_EQ:
+                        if (cmp != 0) return false;
+                        break;
+                    case OP_NE:
+                        if (cmp == 0) return false;
+                        break;
+                    case OP_LT:
+                        if (!(cmp < 0)) return false;
+                        break;
+                    case OP_GT:
+                        if (!(cmp > 0)) return false;
+                        break;
+                    case OP_LE:
+                        if (!(cmp <= 0)) return false;
+                        break;
+                    case OP_GE:
+                        if (!(cmp >= 0)) return false;
+                        break;
+                }
+            }
+            return true;
+        };
+        for (scan_->next(); !scan_->is_end(); scan_->next()) {
+            Rid r = scan_->rid();
+            if (fh_->is_record(r) && satisfy(r)) {
+                rid_ = r;
+                return;
+            }
+        }
     }
 
     /**
@@ -67,7 +187,8 @@ class SeqScanExecutor : public AbstractExecutor {
      * @return std::unique_ptr<RmRecord>
      */
     std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+        if (is_end()) return nullptr;
+        return fh_->get_record(rid_, context_);
     }
 
     Rid &rid() override { return rid_; }

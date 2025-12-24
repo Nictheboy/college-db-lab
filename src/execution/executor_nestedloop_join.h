@@ -43,16 +43,165 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
 
     }
 
-    void beginTuple() override {
+    size_t tupleLen() const override { return len_; }
 
+    const std::vector<ColMeta> &cols() const override { return cols_; }
+
+    bool is_end() const override { return isend; }
+
+    ColMeta get_col_offset(const TabCol &target) override {
+        auto it = get_col(cols_, target);
+        return *it;
+    }
+
+    void beginTuple() override {
+        isend = false;
+        left_->beginTuple();
+        if (left_->is_end()) {
+            isend = true;
+            return;
+        }
+        right_->beginTuple();
+        // 前进到第一个满足连接条件的组合
+        auto satisfy = [&]() -> bool {
+            if (left_->is_end() || right_->is_end()) return false;
+            auto lrec = left_->Next();
+            auto rrec = right_->Next();
+            for (auto &cond : fed_conds_) {
+                // 左右列在各自元组中
+                auto l_it = left_->get_col(left_->cols(), cond.lhs_col);
+                auto r_it = right_->get_col(right_->cols(), cond.rhs_col);
+                char *lhs_ptr = lrec->data + l_it->offset;
+                char *rhs_ptr = rrec->data + r_it->offset;
+                ColType type = l_it->type;
+                int len = l_it->len;
+                int cmp = 0;
+                if (type == TYPE_INT) {
+                    int a = *(int *)lhs_ptr, b = *(int *)rhs_ptr;
+                    cmp = (a < b) ? -1 : ((a > b) ? 1 : 0);
+                } else if (type == TYPE_FLOAT) {
+                    float a = *(float *)lhs_ptr, b = *(float *)rhs_ptr;
+                    cmp = (a < b) ? -1 : ((a > b) ? 1 : 0);
+                } else {
+                    cmp = memcmp(lhs_ptr, rhs_ptr, len);
+                }
+                switch (cond.op) {
+                    case OP_EQ:
+                        if (cmp != 0) return false;
+                        break;
+                    case OP_NE:
+                        if (cmp == 0) return false;
+                        break;
+                    case OP_LT:
+                        if (!(cmp < 0)) return false;
+                        break;
+                    case OP_GT:
+                        if (!(cmp > 0)) return false;
+                        break;
+                    case OP_LE:
+                        if (!(cmp <= 0)) return false;
+                        break;
+                    case OP_GE:
+                        if (!(cmp >= 0)) return false;
+                        break;
+                }
+            }
+            return true;
+        };
+        for (;;) {
+            if (left_->is_end()) {
+                isend = true;
+                return;
+            }
+            while (!right_->is_end()) {
+                if (satisfy()) return;
+                right_->nextTuple();
+            }
+            left_->nextTuple();
+            if (left_->is_end()) {
+                isend = true;
+                return;
+            }
+            right_->beginTuple();
+        }
     }
 
     void nextTuple() override {
-        
+        if (is_end()) return;
+        auto satisfy = [&]() -> bool {
+            if (left_->is_end() || right_->is_end()) return false;
+            auto lrec = left_->Next();
+            auto rrec = right_->Next();
+            for (auto &cond : fed_conds_) {
+                auto l_it = left_->get_col(left_->cols(), cond.lhs_col);
+                auto r_it = right_->get_col(right_->cols(), cond.rhs_col);
+                char *lhs_ptr = lrec->data + l_it->offset;
+                char *rhs_ptr = rrec->data + r_it->offset;
+                ColType type = l_it->type;
+                int len = l_it->len;
+                int cmp = 0;
+                if (type == TYPE_INT) {
+                    int a = *(int *)lhs_ptr, b = *(int *)rhs_ptr;
+                    cmp = (a < b) ? -1 : ((a > b) ? 1 : 0);
+                } else if (type == TYPE_FLOAT) {
+                    float a = *(float *)lhs_ptr, b = *(float *)rhs_ptr;
+                    cmp = (a < b) ? -1 : ((a > b) ? 1 : 0);
+                } else {
+                    cmp = memcmp(lhs_ptr, rhs_ptr, len);
+                }
+                switch (cond.op) {
+                    case OP_EQ:
+                        if (cmp != 0) return false;
+                        break;
+                    case OP_NE:
+                        if (cmp == 0) return false;
+                        break;
+                    case OP_LT:
+                        if (!(cmp < 0)) return false;
+                        break;
+                    case OP_GT:
+                        if (!(cmp > 0)) return false;
+                        break;
+                    case OP_LE:
+                        if (!(cmp <= 0)) return false;
+                        break;
+                    case OP_GE:
+                        if (!(cmp >= 0)) return false;
+                        break;
+                }
+            }
+            return true;
+        };
+        // 从当前(right前进一位)寻找下一个匹配
+        right_->nextTuple();
+        for (;;) {
+            if (left_->is_end()) {
+                isend = true;
+                return;
+            }
+            while (!right_->is_end()) {
+                if (satisfy()) return;
+                right_->nextTuple();
+            }
+            left_->nextTuple();
+            if (left_->is_end()) {
+                isend = true;
+                return;
+            }
+            right_->beginTuple();
+        }
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+        if (is_end()) return nullptr;
+        auto lrec = left_->Next();
+        auto rrec = right_->Next();
+        auto out = std::make_unique<RmRecord>(len_);
+        // 拷贝左表
+        memcpy(out->data, lrec->data, left_->tupleLen());
+        // 拷贝右表
+        memcpy(out->data + left_->tupleLen(), rrec->data, right_->tupleLen());
+        return out;
     }
 
     Rid &rid() override { return _abstract_rid; }

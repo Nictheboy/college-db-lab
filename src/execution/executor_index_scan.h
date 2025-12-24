@@ -64,16 +64,163 @@ class IndexScanExecutor : public AbstractExecutor {
         fed_conds_ = conds_;
     }
 
+    size_t tupleLen() const override { return len_; }
+
+    const std::vector<ColMeta> &cols() const override { return cols_; }
+
+    bool is_end() const override { return scan_ == nullptr || scan_->is_end(); }
+
+    ColMeta get_col_offset(const TabCol &target) override {
+        auto it = get_col(cols_, target);
+        return *it;
+    }
+
     void beginTuple() override {
-        
+        // 构建等值key（当前规划仅支持完全匹配的等值查询）
+        auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_)).get();
+        std::unique_ptr<char[]> key(new char[index_meta_.col_tot_len]);
+        int offset = 0;
+        for (size_t i = 0; i < index_meta_.cols.size(); ++i) {
+            const auto &col = index_meta_.cols[i];
+            bool found = false;
+            for (auto &cond : fed_conds_) {
+                if (cond.is_rhs_val && cond.op == OP_EQ && cond.lhs_col.tab_name == tab_name_ &&
+                    cond.lhs_col.col_name == col.name) {
+                    memcpy(key.get() + offset, cond.rhs_val.raw->data, col.len);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                // 若未找到完整等值条件，则退化为全索引扫描
+                scan_ = std::make_unique<IxScan>(ih, ih->leaf_begin(), ih->leaf_end(), sm_manager_->get_bpm());
+                break;
+            }
+            offset += col.len;
+        }
+        if (scan_ == nullptr) {
+            auto lower = ih->lower_bound(key.get());
+            auto upper = ih->upper_bound(key.get());
+            scan_ = std::make_unique<IxScan>(ih, lower, upper, sm_manager_->get_bpm());
+        }
+        // 前进到第一个满足其他谓词（若有）的元组
+        auto satisfy = [&](const Rid &rid) -> bool {
+            auto rec = fh_->get_record(rid, context_);
+            for (auto &cond : fed_conds_) {
+                auto lhs_it = get_col(cols_, cond.lhs_col);
+                char *lhs_ptr = rec->data + lhs_it->offset;
+                char *rhs_ptr = nullptr;
+                ColType type = lhs_it->type;
+                int len = lhs_it->len;
+                if (cond.is_rhs_val) {
+                    rhs_ptr = cond.rhs_val.raw->data;
+                } else {
+                    auto rhs_it = get_col(cols_, cond.rhs_col);
+                    rhs_ptr = rec->data + rhs_it->offset;
+                }
+                int cmp = 0;
+                if (type == TYPE_INT) {
+                    int a = *(int *)lhs_ptr, b = *(int *)rhs_ptr;
+                    cmp = (a < b) ? -1 : ((a > b) ? 1 : 0);
+                } else if (type == TYPE_FLOAT) {
+                    float a = *(float *)lhs_ptr, b = *(float *)rhs_ptr;
+                    cmp = (a < b) ? -1 : ((a > b) ? 1 : 0);
+                } else {
+                    cmp = memcmp(lhs_ptr, rhs_ptr, len);
+                }
+                switch (cond.op) {
+                    case OP_EQ:
+                        if (cmp != 0) return false;
+                        break;
+                    case OP_NE:
+                        if (cmp == 0) return false;
+                        break;
+                    case OP_LT:
+                        if (!(cmp < 0)) return false;
+                        break;
+                    case OP_GT:
+                        if (!(cmp > 0)) return false;
+                        break;
+                    case OP_LE:
+                        if (!(cmp <= 0)) return false;
+                        break;
+                    case OP_GE:
+                        if (!(cmp >= 0)) return false;
+                        break;
+                }
+            }
+            return true;
+        };
+        for (; !scan_->is_end(); scan_->next()) {
+            Rid r = scan_->rid();
+            if (fh_->is_record(r) && satisfy(r)) {
+                rid_ = r;
+                break;
+            }
+        }
     }
 
     void nextTuple() override {
-        
+        if (is_end()) return;
+        auto satisfy = [&](const Rid &rid) -> bool {
+            auto rec = fh_->get_record(rid, context_);
+            for (auto &cond : fed_conds_) {
+                auto lhs_it = get_col(cols_, cond.lhs_col);
+                char *lhs_ptr = rec->data + lhs_it->offset;
+                char *rhs_ptr = nullptr;
+                ColType type = lhs_it->type;
+                int len = lhs_it->len;
+                if (cond.is_rhs_val) {
+                    rhs_ptr = cond.rhs_val.raw->data;
+                } else {
+                    auto rhs_it = get_col(cols_, cond.rhs_col);
+                    rhs_ptr = rec->data + rhs_it->offset;
+                }
+                int cmp = 0;
+                if (type == TYPE_INT) {
+                    int a = *(int *)lhs_ptr, b = *(int *)rhs_ptr;
+                    cmp = (a < b) ? -1 : ((a > b) ? 1 : 0);
+                } else if (type == TYPE_FLOAT) {
+                    float a = *(float *)lhs_ptr, b = *(float *)rhs_ptr;
+                    cmp = (a < b) ? -1 : ((a > b) ? 1 : 0);
+                } else {
+                    cmp = memcmp(lhs_ptr, rhs_ptr, len);
+                }
+                switch (cond.op) {
+                    case OP_EQ:
+                        if (cmp != 0) return false;
+                        break;
+                    case OP_NE:
+                        if (cmp == 0) return false;
+                        break;
+                    case OP_LT:
+                        if (!(cmp < 0)) return false;
+                        break;
+                    case OP_GT:
+                        if (!(cmp > 0)) return false;
+                        break;
+                    case OP_LE:
+                        if (!(cmp <= 0)) return false;
+                        break;
+                    case OP_GE:
+                        if (!(cmp >= 0)) return false;
+                        break;
+                }
+            }
+            return true;
+        };
+        for (scan_->next(); !scan_->is_end(); scan_->next()) {
+            Rid r = scan_->rid();
+            if (fh_->is_record(r) && satisfy(r)) {
+                rid_ = r;
+                return;
+            }
+        }
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        return nullptr;
+        if (is_end()) return nullptr;
+        return fh_->get_record(rid_, context_);
     }
 
     Rid &rid() override { return rid_; }
