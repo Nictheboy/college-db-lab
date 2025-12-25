@@ -55,20 +55,24 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
     }
 
     void beginTuple() override {
+        // 1. 初始化连接状态。isend 为 true 时表示整个连接扫描结束。
         isend = false;
         left_->beginTuple();
         if (left_->is_end()) {
-            isend = true;
+            isend = true; // 左表为空，连接结果必然为空。
             return;
         }
+        // 2. 初始化右子算子。嵌套循环连接的逻辑是：固定左表的一行，遍历右表的所有行。
         right_->beginTuple();
-        // 前进到第一个满足连接条件的组合
+
+        // 3. 定义连接谓词判断逻辑。
+        // 与单表不同，这里的条件通常涉及两个表的列（如 student.id = grade.student_id）。
         auto satisfy = [&]() -> bool {
             if (left_->is_end() || right_->is_end()) return false;
             auto lrec = left_->Next();
             auto rrec = right_->Next();
             for (auto &cond : fed_conds_) {
-                // 左右列在各自元组中
+                // 关键点：从左、右子算子的元数据中分别定位需要比较的列。
                 auto l_it = left_->get_col(left_->cols(), cond.lhs_col);
                 auto r_it = right_->get_col(right_->cols(), cond.rhs_col);
                 char *lhs_ptr = lrec->data + l_it->offset;
@@ -85,49 +89,38 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
                 } else {
                     cmp = memcmp(lhs_ptr, rhs_ptr, len);
                 }
+                // 如果任一连接条件不成立，则该左右元组组合不符合结果。
                 switch (cond.op) {
-                    case OP_EQ:
-                        if (cmp != 0) return false;
-                        break;
-                    case OP_NE:
-                        if (cmp == 0) return false;
-                        break;
-                    case OP_LT:
-                        if (!(cmp < 0)) return false;
-                        break;
-                    case OP_GT:
-                        if (!(cmp > 0)) return false;
-                        break;
-                    case OP_LE:
-                        if (!(cmp <= 0)) return false;
-                        break;
-                    case OP_GE:
-                        if (!(cmp >= 0)) return false;
-                        break;
+                    case OP_EQ: if (cmp != 0) return false; break;
+                    case OP_NE: if (cmp == 0) return false; break;
+                    case OP_LT: if (!(cmp < 0)) return false; break;
+                    case OP_GT: if (!(cmp > 0)) return false; break;
+                    case OP_LE: if (!(cmp <= 0)) return false; break;
+                    case OP_GE: if (!(cmp >= 0)) return false; break;
                 }
             }
             return true;
         };
+
+        // 4. 执行双层循环寻找第一对匹配。
         for (;;) {
-            if (left_->is_end()) {
-                isend = true;
-                return;
-            }
+            if (left_->is_end()) { isend = true; return; }
             while (!right_->is_end()) {
+                // 如果当前组合满足连接条件，则停止，当前状态即为第一条结果。
                 if (satisfy()) return;
-                right_->nextTuple();
+                right_->nextTuple(); // 步进内层（右表）。
             }
+            // 右表遍历完了，左表进位，并将右表重置回开头。
             left_->nextTuple();
-            if (left_->is_end()) {
-                isend = true;
-                return;
-            }
+            if (left_->is_end()) { isend = true; return; }
             right_->beginTuple();
         }
     }
 
     void nextTuple() override {
         if (is_end()) return;
+
+        // 定义满足条件的闭包。
         auto satisfy = [&]() -> bool {
             if (left_->is_end() || right_->is_end()) return false;
             auto lrec = left_->Next();
@@ -150,57 +143,48 @@ class NestedLoopJoinExecutor : public AbstractExecutor {
                     cmp = memcmp(lhs_ptr, rhs_ptr, len);
                 }
                 switch (cond.op) {
-                    case OP_EQ:
-                        if (cmp != 0) return false;
-                        break;
-                    case OP_NE:
-                        if (cmp == 0) return false;
-                        break;
-                    case OP_LT:
-                        if (!(cmp < 0)) return false;
-                        break;
-                    case OP_GT:
-                        if (!(cmp > 0)) return false;
-                        break;
-                    case OP_LE:
-                        if (!(cmp <= 0)) return false;
-                        break;
-                    case OP_GE:
-                        if (!(cmp >= 0)) return false;
-                        break;
+                    case OP_EQ: if (cmp != 0) return false; break;
+                    case OP_NE: if (cmp == 0) return false; break;
+                    case OP_LT: if (!(cmp < 0)) return false; break;
+                    case OP_GT: if (!(cmp > 0)) return false; break;
+                    case OP_LE: if (!(cmp <= 0)) return false; break;
+                    case OP_GE: if (!(cmp >= 0)) return false; break;
                 }
             }
             return true;
         };
-        // 从当前(right前进一位)寻找下一个匹配
+
+        // 从“右表的下一条”开始寻找下一对匹配组合。
         right_->nextTuple();
         for (;;) {
-            if (left_->is_end()) {
-                isend = true;
-                return;
-            }
+            if (left_->is_end()) { isend = true; return; }
             while (!right_->is_end()) {
                 if (satisfy()) return;
                 right_->nextTuple();
             }
+            // 内层循环结束，外层进位并重置内层。
             left_->nextTuple();
-            if (left_->is_end()) {
-                isend = true;
-                return;
-            }
+            if (left_->is_end()) { isend = true; return; }
             right_->beginTuple();
         }
     }
 
     std::unique_ptr<RmRecord> Next() override {
+        // 1. 结束检查。
         if (is_end()) return nullptr;
+        // 2. 获取当前匹配的左右元组。
         auto lrec = left_->Next();
         auto rrec = right_->Next();
+        
+        // 3. 创建拼接后的新元组。长度为左右两表元组长度之和。
         auto out = std::make_unique<RmRecord>(len_);
-        // 拷贝左表
+        
+        // 4. 数据拼接。
+        // 将左表记录拷贝到新 Buffer 的起始位置。
         memcpy(out->data, lrec->data, left_->tupleLen());
-        // 拷贝右表
+        // 将右表记录拷贝到左表数据之后，实现拼接。
         memcpy(out->data + left_->tupleLen(), rrec->data, right_->tupleLen());
+        
         return out;
     }
 

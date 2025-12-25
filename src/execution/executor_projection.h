@@ -50,19 +50,36 @@ class ProjectionExecutor : public AbstractExecutor {
         return *it;
     }
 
-    void beginTuple() override { prev_->beginTuple(); }
+    void beginTuple() override { 
+        // 投影算子是中间节点，直接调用子算子的起始接口体体
+        prev_->beginTuple(); 
+    }
 
-    void nextTuple() override { prev_->nextTuple(); }
+    void nextTuple() override { 
+        // 步进逻辑也直接透传给子算子体体
+        prev_->nextTuple(); 
+    }
 
     std::unique_ptr<RmRecord> Next() override {
+        // 1. 检查子算子是否还有数据体体
         if (is_end()) return nullptr;
+        // 2. 从子算子获取当前的原始元组体体
         auto in = prev_->Next();
-        // 组装投影后的记录
+        
+        // 3. 创建一个新的、长度为投影后总长度的空元组体体
         auto out = std::make_unique<RmRecord>(len_);
+        
+        // 4. 执行字段拷贝逻辑体体。
+        // sel_idxs_ 存储了“投影后的第 i 列对应原始元组的第几个字段”。
         const auto &prev_cols = prev_->cols();
         for (size_t i = 0; i < sel_idxs_.size(); ++i) {
+            // 获取源列的元数据（提供源偏移量）体体
             const auto &src_col = prev_cols[sel_idxs_[i]];
+            // 获取目标列的元数据（提供目标偏移量）体体
             const auto &dst_col = cols_[i];
+            
+            // 使用 memcpy 按照字段长度，将数据从原始 Buffer 拷贝到新记录的对应位置体体。
+            // 这一步实现了 SQL 中的列筛选（裁剪不需要的列）和列重排（改变输出顺序）。
             memcpy(out->data + dst_col.offset, in->data + src_col.offset, dst_col.len);
         }
         return out;

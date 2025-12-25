@@ -37,25 +37,35 @@ class DeleteExecutor : public AbstractExecutor {
     }
 
     std::unique_ptr<RmRecord> Next() override {
-        // 逐条删除
+        // 1. 迭代执行计划中提供的所有待删除记录的 RID 集合体体。
+        // 这些 RID 通常由底层的扫描算子预先收集。
         for (auto &rid : rids_) {
-            // 获取旧记录，用于索引键
+            // 2. 获取旧记录内容体体。
+            // 必须在物理删除前拉取数据，因为我们需要旧数据来构造索引的 Key。
             auto rec = fh_->get_record(rid, context_);
-            // 删除索引项
+
+            // 3. 维护索引：逐个删除该表上的所有索引项体体。
             for (auto &index : tab_.indexes) {
+                // 定位索引句柄体体
                 auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index.cols)).get();
-                // 组装复合键
+                
+                // 组装当前记录在该索引下的复合键体体
                 std::unique_ptr<char[]> key(new char[index.col_tot_len]);
                 int offset = 0;
                 for (int i = 0; i < index.col_num; ++i) {
+                    // 按照索引定义的列顺序，从记录 Buffer 中拷贝数据体体
                     memcpy(key.get() + offset, rec->data + index.cols[i].offset, index.cols[i].len);
                     offset += index.cols[i].len;
                 }
+                // 从 B+ 树中物理删除对应的 Entry (Key, RID) 体体
                 ih->delete_entry(key.get(), context_->txn_);
             }
-            // 删除记录
+
+            // 4. 物理删除记录体体。
+            // 在 RmFileHandle 中将该 rid 对应的位图标记设为无效体体。
             fh_->delete_record(rid, context_);
         }
+        // 按照 DML 算子规约，返回空表示操作执行完毕体体
         return nullptr;
     }
 

@@ -85,34 +85,43 @@ void SmManager::drop_db(const std::string& db_name) {
  * @param {string&} db_name 数据库名称，与文件夹同名
  */
 void SmManager::open_db(const std::string& db_name) {
+    // 1. 安全检查：如果文件夹不存在，说明数据库还没创建，直接抛出异常
     if (!is_dir(db_name)) {
         throw DatabaseNotFoundError(db_name);
     }
-    // 进入数据库目录
+    // 2. 切换当前工作目录进入数据库文件夹。
+    // 这步非常关键，因为后续的表文件、索引文件和 db.meta 都是以相对路径存储在这个文件夹下的。
     if (chdir(db_name.c_str()) < 0) {
         throw UnixError();
     }
-    // 读取元数据
+    // 3. 读取元数据文件 (db.meta)。
+    // 这个文件存储了当前数据库里有哪些表，每张表有哪些列，以及每张表上有哪些索引。
     {
         std::ifstream ifs(DB_META_NAME);
         if (!ifs.good()) {
             throw FileNotFoundError(DB_META_NAME);
         }
+        // 使用重载的 >> 运算符，将文件内容反序列化到 db_ 成员变量中
         ifs >> db_;
     }
-    // 打开所有表的数据文件
+    // 4. 加载所有表的记录文件句柄 (fhs_)。
+    // 系统启动时需要把磁盘上的文件打开，获取句柄后存入内存哈希表，以便后续增删改查算子能直接使用。
     fhs_.clear();
     for (auto &entry : db_.tabs_) {
         const std::string &tab_name = entry.first;
+        // rm_manager_ 负责打开记录文件并返回一个文件句柄
         fhs_.emplace(tab_name, rm_manager_->open_file(tab_name));
     }
-    // 打开所有索引文件
+    // 5. 加载所有索引的文件句柄 (ihs_)。
+    // 索引也是以文件形式存储的，我们需要根据 TabMeta 记录的索引信息逐一打开。
     ihs_.clear();
     for (auto &entry : db_.tabs_) {
         auto &tab = entry.second;
         for (auto &index_meta : tab.indexes) {
+            // 根据表名和列名列表，通过 ix_manager 计算出索引在磁盘上的文件名
             auto ih = ix_manager_->open_index(tab.name, index_meta.cols);
             std::string ix_name = ix_manager_->get_index_name(tab.name, index_meta.cols);
+            // 将索引句柄存入哈希表，key 是索引文件名
             ihs_.emplace(ix_name, std::move(ih));
         }
     }
@@ -122,7 +131,8 @@ void SmManager::open_db(const std::string& db_name) {
  * @description: 把数据库相关的元数据刷入磁盘中
  */
 void SmManager::flush_meta() {
-    // 默认清空文件
+    // 默认清空文件并重新写入当前的 db_ 结构。
+    // 这是保证内存中的元数据变更（如新建表、删索引）能够持久化到磁盘的唯一手段。
     std::ofstream ofs(DB_META_NAME);
     ofs << db_;
 }
@@ -131,22 +141,25 @@ void SmManager::flush_meta() {
  * @description: 关闭数据库并把数据落盘
  */
 void SmManager::close_db() {
-    // 将元数据落盘
+    // 1. 将最新的元数据写回 db.meta 文件体体
     flush_meta();
-    // 关闭所有记录文件
+    // 2. 依次关闭所有打开的表文件句柄。
+    // close_file 会将记录文件的 header 信息刷盘，并确保 BufferPool 里的脏页全部写入磁盘。
     for (auto &entry : fhs_) {
         rm_manager_->close_file(entry.second.get());
     }
     fhs_.clear();
-    // 关闭所有索引文件
+    // 3. 依次关闭所有打开的索引文件句柄。
+    // 同理，close_index 会处理 B+ 树节点刷盘和文件头更新。
     for (auto &entry : ihs_) {
         ix_manager_->close_index(entry.second.get());
     }
     ihs_.clear();
-    // 清理内存中的DbMeta
+    // 4. 清空内存中 db_ 结构体，标志当前没有打开任何数据库
     db_.name_.clear();
     db_.tabs_.clear();
-    // 回到根目录
+    // 5. 退出数据库文件夹，回到父目录。
+    // 这一步与 open_db 时的 chdir 对称，防止系统在后续操作中路径错乱。
     if (chdir("..") < 0) {
         throw UnixError();
     }
@@ -236,28 +249,36 @@ void SmManager::create_table(const std::string& tab_name, const std::vector<ColD
  * @param {Context*} context
  */
 void SmManager::drop_table(const std::string& tab_name, Context* context) {
+    // 1. 检查表是否存在体
     if (!db_.is_table(tab_name)) {
         throw TableNotFoundError(tab_name);
     }
-    // 关闭并删除该表的索引
+    // 2. 级联删除索引。
+    // 在删除表之前，必须先清理该表上的所有索引，否则会留下孤立的索引文件。
     TabMeta &tab = db_.get_table(tab_name);
     for (auto &index_meta : tab.indexes) {
+        // 先根据索引定义的列，计算出它在磁盘的文件名
         std::string ix_name = ix_manager_->get_index_name(tab_name, index_meta.cols);
         auto it_ih = ihs_.find(ix_name);
+        // 如果该索引目前被打开了，先关闭它的句柄并从 ihs_ 缓存中移除
         if (it_ih != ihs_.end()) {
             ix_manager_->close_index(it_ih->second.get());
             ihs_.erase(it_ih);
         }
+        // 物理删除磁盘上的 .idx 文件
         ix_manager_->destroy_index(tab_name, index_meta.cols);
     }
-    // 关闭并删除记录文件
+    // 3. 删除记录文件。
+    // 同样，先在缓存中查找是否有打开的句柄 (fhs_)
     auto it_fh = fhs_.find(tab_name);
     if (it_fh != fhs_.end()) {
+        // 关闭并从句柄池中移除，避免后续对已删除文件的非法引用
         rm_manager_->close_file(it_fh->second.get());
         fhs_.erase(it_fh);
     }
+    // 物理删除磁盘上的记录文件（通常无后缀名）
     rm_manager_->destroy_file(tab_name);
-    // 从元数据中移除该表并落盘
+    // 4. 更新内存中的数据库元数据，将该表的信息彻底移除，并同步到 db.meta 文件
     db_.tabs_.erase(tab_name);
     flush_meta();
 }
@@ -269,33 +290,36 @@ void SmManager::drop_table(const std::string& tab_name, Context* context) {
  * @param {Context*} context
  */
 void SmManager::create_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
-    // 校验表是否存在
+    // 1. 基础校验：表必须存在
     if (!db_.is_table(tab_name)) {
         throw TableNotFoundError(tab_name);
     }
     TabMeta &tab = db_.get_table(tab_name);
-    // 校验索引是否已存在（按字段顺序）
+    // 2. 校验索引是否已经存在。不支持在同一组列（且顺序一致）上创建重复索引。
     if (tab.is_index(col_names)) {
         throw IndexExistsError(tab_name, col_names);
     }
-    // 组装索引元数据
+    // 3. 构建索引元数据体体 (IndexMeta)
     IndexMeta index_meta;
     index_meta.tab_name = tab_name;
     index_meta.col_tot_len = 0;
     index_meta.col_num = static_cast<int>(col_names.size());
     index_meta.cols.clear();
     for (auto &name : col_names) {
+        // 定位列的详细信息（类型、长度等），索引需要知道如何存储和比较这些列
         auto it = tab.get_col(name);
         index_meta.cols.push_back(*it);
         index_meta.col_tot_len += it->len;
-        // 标记该列存在索引（供展示）
+        // 标记该列“存在索引”，这样 desc table 时能展示 YES
         it->index = true;
     }
-    // 创建索引文件
+    // 4. 物理创建索引文件。ix_manager 负责初始化 B+ 树的根节点和 header。
     ix_manager_->create_index(tab_name, index_meta.cols);
-    // 记录到表元数据
+    // 5. 将索引信息加入到表的元数据中，并打开它以便立即可用
     tab.indexes.push_back(index_meta);
-    // 刷盘元数据
+    std::string ix_name = ix_manager_->get_index_name(tab_name, col_names);
+    ihs_.emplace(ix_name, ix_manager_->open_index(tab_name, col_names));
+    // 6. 元数据变更落盘体体
     flush_meta();
 }
 
@@ -306,63 +330,55 @@ void SmManager::create_index(const std::string& tab_name, const std::vector<std:
  * @param {Context*} context
  */
 void SmManager::drop_index(const std::string& tab_name, const std::vector<std::string>& col_names, Context* context) {
+    // 1. 校验表是否存在
     if (!db_.is_table(tab_name)) {
         throw TableNotFoundError(tab_name);
     }
     TabMeta &tab = db_.get_table(tab_name);
-    // 检查索引是否存在
+    // 2. 校验索引是否存在体体体体
     if (!tab.is_index(col_names)) {
         throw IndexNotFoundError(tab_name, col_names);
     }
-    // 关闭并删除索引文件
+    // 3. 释放资源。先找到内存中打开的索引句柄体体
     std::string ix_name = ix_manager_->get_index_name(tab_name, col_names);
     auto it_ih = ihs_.find(ix_name);
     if (it_ih != ihs_.end()) {
+        // 关闭并销毁内存句柄
         ix_manager_->close_index(it_ih->second.get());
         ihs_.erase(it_ih);
     }
+    // 物理删除磁盘上的 .idx 文件
     ix_manager_->destroy_index(tab_name, col_names);
-    // 更新列上的index标记并从表元数据删除该索引
+    // 4. 更新元数据：将列上的索引标记设为 false，并从 TabMeta 的索引列表中移除该项体体体体
     for (auto &name : col_names) {
         auto it_col = tab.get_col(name);
         it_col->index = false;
     }
-    // 从tab.indexes中移除对应meta
     auto it = tab.indexes.begin();
     while (it != tab.indexes.end()) {
+        // 查找字段列表完全一致的索引条目体体
         if (it->col_num == (int)col_names.size()) {
             bool match = true;
             for (int i = 0; i < it->col_num; ++i) {
-                if (it->cols[i].name != col_names[i]) {
-                    match = false;
-                    break;
-                }
+                if (it->cols[i].name != col_names[i]) { match = false; break; }
             }
-            if (match) {
-                it = tab.indexes.erase(it);
-                break;
-            } else {
-                ++it;
-            }
-        } else {
-            ++it;
-        }
+            if (match) { it = tab.indexes.erase(it); break; } 
+            else { ++it; }
+        } else { ++it; }
     }
+    // 5. 同步元数据体体
     flush_meta();
 }
 
 /**
- * @description: 删除索引
- * @param {string&} tab_name 表名称
- * @param {vector<ColMeta>&} 索引包含的字段元数据
- * @param {Context*} context
+ * @description: 删除索引 (重载版本，直接接收 ColMeta 列表)
  */
 void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMeta>& cols, Context* context) {
+    // 逻辑与上述版本基本一致体体
     if (!db_.is_table(tab_name)) {
         throw TableNotFoundError(tab_name);
     }
     TabMeta &tab = db_.get_table(tab_name);
-    // 关闭并删除索引文件
     std::string ix_name = ix_manager_->get_index_name(tab_name, cols);
     auto it_ih = ihs_.find(ix_name);
     if (it_ih != ihs_.end()) {
@@ -370,7 +386,6 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMet
         ihs_.erase(it_ih);
     }
     ix_manager_->destroy_index(tab_name, cols);
-    // 更新列上的index标记并从表元数据删除该索引
     for (auto &col : cols) {
         auto it_col = tab.get_col(col.name);
         it_col->index = false;
@@ -380,20 +395,11 @@ void SmManager::drop_index(const std::string& tab_name, const std::vector<ColMet
         if (it->col_num == (int)cols.size()) {
             bool match = true;
             for (int i = 0; i < it->col_num; ++i) {
-                if (it->cols[i].name != cols[i].name) {
-                    match = false;
-                    break;
-                }
+                if (it->cols[i].name != cols[i].name) { match = false; break; }
             }
-            if (match) {
-                it = tab.indexes.erase(it);
-                break;
-            } else {
-                ++it;
-            }
-        } else {
-            ++it;
-        }
+            if (match) { it = tab.indexes.erase(it); break; }
+            else { ++it; }
+        } else { ++it; }
     }
     flush_meta();
 }

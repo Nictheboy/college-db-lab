@@ -61,22 +61,33 @@ class SeqScanExecutor : public AbstractExecutor {
      *
      */
     void beginTuple() override {
+        // 1. 初始化扫描器体体。RmScan 是底层记录层的迭代器，用于遍历表中的所有记录。
         scan_ = std::make_unique<RmScan>(fh_);
-        // 将scan_移动到第一个满足条件的记录
+
+        // 2. 定义谓词判断闭包体体 (Lambda)。用于检查给定的记录是否满足 WHERE 条件。
         auto satisfy = [&](const Rid &rid) -> bool {
+            // 从底层拉取完整的记录数据体体
             auto rec = fh_->get_record(rid, context_);
+            // 遍历执行计划中的所有条件（AND 关系）
             for (auto &cond : fed_conds_) {
+                // 获取左侧列的偏移量和元数据体体
                 auto lhs_it = get_col(cols_, cond.lhs_col);
                 char *lhs_ptr = rec->data + lhs_it->offset;
                 char *rhs_ptr = nullptr;
                 ColType type = lhs_it->type;
                 int len = lhs_it->len;
+
+                // 确定右侧操作数的值指针体体
                 if (cond.is_rhs_val) {
+                    // 右侧是常量：在分析阶段已经转换成了原始二进制体体
                     rhs_ptr = cond.rhs_val.raw->data;
                 } else {
+                    // 右侧是另一列：从当前记录中提取偏移体体
                     auto rhs_it = get_col(cols_, cond.rhs_col);
                     rhs_ptr = rec->data + rhs_it->offset;
                 }
+
+                // 执行类型相关的比较逻辑体体
                 int cmp = 0;
                 if (type == TYPE_INT) {
                     int a = *(int *)lhs_ptr, b = *(int *)rhs_ptr;
@@ -85,35 +96,29 @@ class SeqScanExecutor : public AbstractExecutor {
                     float a = *(float *)lhs_ptr, b = *(float *)rhs_ptr;
                     cmp = (a < b) ? -1 : ((a > b) ? 1 : 0);
                 } else {
+                    // 字符串：直接使用字节比较体体
                     cmp = memcmp(lhs_ptr, rhs_ptr, len);
                 }
+
+                // 根据操作符判断比较结果是否成立体体
                 switch (cond.op) {
-                    case OP_EQ:
-                        if (cmp != 0) return false;
-                        break;
-                    case OP_NE:
-                        if (cmp == 0) return false;
-                        break;
-                    case OP_LT:
-                        if (!(cmp < 0)) return false;
-                        break;
-                    case OP_GT:
-                        if (!(cmp > 0)) return false;
-                        break;
-                    case OP_LE:
-                        if (!(cmp <= 0)) return false;
-                        break;
-                    case OP_GE:
-                        if (!(cmp >= 0)) return false;
-                        break;
+                    case OP_EQ: if (cmp != 0) return false; break;
+                    case OP_NE: if (cmp == 0) return false; break;
+                    case OP_LT: if (!(cmp < 0)) return false; break;
+                    case OP_GT: if (!(cmp > 0)) return false; break;
+                    case OP_LE: if (!(cmp <= 0)) return false; break;
+                    case OP_GE: if (!(cmp >= 0)) return false; break;
                 }
             }
-            return true;
+            return true; // 所有条件均通过
         };
+
+        // 3. 寻找起始位置。从头开始遍历记录，直到找到第一个满足条件的记录体体
         for (; !scan_->is_end(); scan_->next()) {
             Rid r = scan_->rid();
+            // 注意：必须检查该 slot 是否真的存有有效记录（位图标记）体体
             if (fh_->is_record(r) && satisfy(r)) {
-                rid_ = r;
+                rid_ = r; // 记录当前找到的符合条件的 rid
                 break;
             }
         }
@@ -124,58 +129,43 @@ class SeqScanExecutor : public AbstractExecutor {
      *
      */
     void nextTuple() override {
+        // 如果已经到结尾了，直接返回体体
         if (is_end()) return;
+
+        // 复用同样的 satisfy 逻辑体体
         auto satisfy = [&](const Rid &rid) -> bool {
             auto rec = fh_->get_record(rid, context_);
             for (auto &cond : fed_conds_) {
                 auto lhs_it = get_col(cols_, cond.lhs_col);
                 char *lhs_ptr = rec->data + lhs_it->offset;
-                char *rhs_ptr = nullptr;
-                ColType type = lhs_it->type;
-                int len = lhs_it->len;
-                if (cond.is_rhs_val) {
-                    rhs_ptr = cond.rhs_val.raw->data;
-                } else {
-                    auto rhs_it = get_col(cols_, cond.rhs_col);
-                    rhs_ptr = rec->data + rhs_it->offset;
-                }
+                char *rhs_ptr = cond.is_rhs_val ? cond.rhs_val.raw->data : (rec->data + get_col(cols_, cond.rhs_col)->offset);
                 int cmp = 0;
-                if (type == TYPE_INT) {
+                if (lhs_it->type == TYPE_INT) {
                     int a = *(int *)lhs_ptr, b = *(int *)rhs_ptr;
                     cmp = (a < b) ? -1 : ((a > b) ? 1 : 0);
-                } else if (type == TYPE_FLOAT) {
+                } else if (lhs_it->type == TYPE_FLOAT) {
                     float a = *(float *)lhs_ptr, b = *(float *)rhs_ptr;
                     cmp = (a < b) ? -1 : ((a > b) ? 1 : 0);
                 } else {
-                    cmp = memcmp(lhs_ptr, rhs_ptr, len);
+                    cmp = memcmp(lhs_ptr, rhs_ptr, lhs_it->len);
                 }
                 switch (cond.op) {
-                    case OP_EQ:
-                        if (cmp != 0) return false;
-                        break;
-                    case OP_NE:
-                        if (cmp == 0) return false;
-                        break;
-                    case OP_LT:
-                        if (!(cmp < 0)) return false;
-                        break;
-                    case OP_GT:
-                        if (!(cmp > 0)) return false;
-                        break;
-                    case OP_LE:
-                        if (!(cmp <= 0)) return false;
-                        break;
-                    case OP_GE:
-                        if (!(cmp >= 0)) return false;
-                        break;
+                    case OP_EQ: if (cmp != 0) return false; break;
+                    case OP_NE: if (cmp == 0) return false; break;
+                    case OP_LT: if (!(cmp < 0)) return false; break;
+                    case OP_GT: if (!(cmp > 0)) return false; break;
+                    case OP_LE: if (!(cmp <= 0)) return false; break;
+                    case OP_GE: if (!(cmp >= 0)) return false; break;
                 }
             }
             return true;
         };
+
+        // 从当前位置的“下一条”开始寻找体体
         for (scan_->next(); !scan_->is_end(); scan_->next()) {
             Rid r = scan_->rid();
             if (fh_->is_record(r) && satisfy(r)) {
-                rid_ = r;
+                rid_ = r; // 更新当前找到的 rid
                 return;
             }
         }
@@ -187,7 +177,9 @@ class SeqScanExecutor : public AbstractExecutor {
      * @return std::unique_ptr<RmRecord>
      */
     std::unique_ptr<RmRecord> Next() override {
+        // 按照火山模型，如果迭代结束则返回空指针体体
         if (is_end()) return nullptr;
+        // 否则返回当前 rid 指向的记录体体
         return fh_->get_record(rid_, context_);
     }
 

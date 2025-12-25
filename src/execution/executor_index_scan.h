@@ -76,13 +76,18 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     void beginTuple() override {
-        // 构建等值key（当前规划仅支持完全匹配的等值查询）
+        // 1. 获取索引句柄体体。通过 sm_manager 查找预先打开的 B+ 树句柄体体。
         auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_)).get();
+        
+        // 2. 尝试构建等值查询的 Key 体体。
+        // 对于复合索引（多个列），我们需要把各个列的等值常量拼接成一个完整的字节串体体。
         std::unique_ptr<char[]> key(new char[index_meta_.col_tot_len]);
         int offset = 0;
+        bool full_match = true;
         for (size_t i = 0; i < index_meta_.cols.size(); ++i) {
             const auto &col = index_meta_.cols[i];
             bool found = false;
+            // 在 WHERE 条件中寻找匹配该列的等值谓词体体
             for (auto &cond : fed_conds_) {
                 if (cond.is_rhs_val && cond.op == OP_EQ && cond.lhs_col.tab_name == tab_name_ &&
                     cond.lhs_col.col_name == col.name) {
@@ -92,65 +97,54 @@ class IndexScanExecutor : public AbstractExecutor {
                 }
             }
             if (!found) {
-                // 若未找到完整等值条件，则退化为全索引扫描
+                // 如果索引中的某一列没有等值条件，我们无法使用 B+ 树范围查询体体。
+                // 此时退化为全索引扫描（即遍历整个 B+ 树的叶子节点链表）体体。
                 scan_ = std::make_unique<IxScan>(ih, ih->leaf_begin(), ih->leaf_end(), sm_manager_->get_bpm());
+                full_match = false;
                 break;
             }
             offset += col.len;
         }
-        if (scan_ == nullptr) {
+
+        // 3. 执行 B+ 树查找体体。
+        // 如果所有索引列都有等值条件，使用 lower_bound 和 upper_bound 确定扫描范围体体。
+        if (full_match) {
             auto lower = ih->lower_bound(key.get());
             auto upper = ih->upper_bound(key.get());
             scan_ = std::make_unique<IxScan>(ih, lower, upper, sm_manager_->get_bpm());
         }
-        // 前进到第一个满足其他谓词（若有）的元组
+
+        // 4. 定义谓词过滤逻辑体体。
+        // 注意：即便索引返回了 rid，我们仍需通过 satisfy 检查那些没被索引覆盖的条件体体。
         auto satisfy = [&](const Rid &rid) -> bool {
             auto rec = fh_->get_record(rid, context_);
             for (auto &cond : fed_conds_) {
                 auto lhs_it = get_col(cols_, cond.lhs_col);
                 char *lhs_ptr = rec->data + lhs_it->offset;
-                char *rhs_ptr = nullptr;
-                ColType type = lhs_it->type;
-                int len = lhs_it->len;
-                if (cond.is_rhs_val) {
-                    rhs_ptr = cond.rhs_val.raw->data;
-                } else {
-                    auto rhs_it = get_col(cols_, cond.rhs_col);
-                    rhs_ptr = rec->data + rhs_it->offset;
-                }
+                char *rhs_ptr = cond.is_rhs_val ? cond.rhs_val.raw->data : (rec->data + get_col(cols_, cond.rhs_col)->offset);
                 int cmp = 0;
-                if (type == TYPE_INT) {
+                if (lhs_it->type == TYPE_INT) {
                     int a = *(int *)lhs_ptr, b = *(int *)rhs_ptr;
                     cmp = (a < b) ? -1 : ((a > b) ? 1 : 0);
-                } else if (type == TYPE_FLOAT) {
+                } else if (lhs_it->type == TYPE_FLOAT) {
                     float a = *(float *)lhs_ptr, b = *(float *)rhs_ptr;
                     cmp = (a < b) ? -1 : ((a > b) ? 1 : 0);
                 } else {
-                    cmp = memcmp(lhs_ptr, rhs_ptr, len);
+                    cmp = memcmp(lhs_ptr, rhs_ptr, lhs_it->len);
                 }
                 switch (cond.op) {
-                    case OP_EQ:
-                        if (cmp != 0) return false;
-                        break;
-                    case OP_NE:
-                        if (cmp == 0) return false;
-                        break;
-                    case OP_LT:
-                        if (!(cmp < 0)) return false;
-                        break;
-                    case OP_GT:
-                        if (!(cmp > 0)) return false;
-                        break;
-                    case OP_LE:
-                        if (!(cmp <= 0)) return false;
-                        break;
-                    case OP_GE:
-                        if (!(cmp >= 0)) return false;
-                        break;
+                    case OP_EQ: if (cmp != 0) return false; break;
+                    case OP_NE: if (cmp == 0) return false; break;
+                    case OP_LT: if (!(cmp < 0)) return false; break;
+                    case OP_GT: if (!(cmp > 0)) return false; break;
+                    case OP_LE: if (!(cmp <= 0)) return false; break;
+                    case OP_GE: if (!(cmp >= 0)) return false; break;
                 }
             }
             return true;
         };
+
+        // 5. 移动到扫描范围内的第一个符合所有条件的记录体体
         for (; !scan_->is_end(); scan_->next()) {
             Rid r = scan_->rid();
             if (fh_->is_record(r) && satisfy(r)) {
@@ -162,53 +156,37 @@ class IndexScanExecutor : public AbstractExecutor {
 
     void nextTuple() override {
         if (is_end()) return;
+
+        // 复用过滤逻辑体体
         auto satisfy = [&](const Rid &rid) -> bool {
             auto rec = fh_->get_record(rid, context_);
             for (auto &cond : fed_conds_) {
                 auto lhs_it = get_col(cols_, cond.lhs_col);
                 char *lhs_ptr = rec->data + lhs_it->offset;
-                char *rhs_ptr = nullptr;
-                ColType type = lhs_it->type;
-                int len = lhs_it->len;
-                if (cond.is_rhs_val) {
-                    rhs_ptr = cond.rhs_val.raw->data;
-                } else {
-                    auto rhs_it = get_col(cols_, cond.rhs_col);
-                    rhs_ptr = rec->data + rhs_it->offset;
-                }
+                char *rhs_ptr = cond.is_rhs_val ? cond.rhs_val.raw->data : (rec->data + get_col(cols_, cond.rhs_col)->offset);
                 int cmp = 0;
-                if (type == TYPE_INT) {
+                if (lhs_it->type == TYPE_INT) {
                     int a = *(int *)lhs_ptr, b = *(int *)rhs_ptr;
                     cmp = (a < b) ? -1 : ((a > b) ? 1 : 0);
-                } else if (type == TYPE_FLOAT) {
+                } else if (lhs_it->type == TYPE_FLOAT) {
                     float a = *(float *)lhs_ptr, b = *(float *)rhs_ptr;
                     cmp = (a < b) ? -1 : ((a > b) ? 1 : 0);
                 } else {
-                    cmp = memcmp(lhs_ptr, rhs_ptr, len);
+                    cmp = memcmp(lhs_ptr, rhs_ptr, lhs_it->len);
                 }
                 switch (cond.op) {
-                    case OP_EQ:
-                        if (cmp != 0) return false;
-                        break;
-                    case OP_NE:
-                        if (cmp == 0) return false;
-                        break;
-                    case OP_LT:
-                        if (!(cmp < 0)) return false;
-                        break;
-                    case OP_GT:
-                        if (!(cmp > 0)) return false;
-                        break;
-                    case OP_LE:
-                        if (!(cmp <= 0)) return false;
-                        break;
-                    case OP_GE:
-                        if (!(cmp >= 0)) return false;
-                        break;
+                    case OP_EQ: if (cmp != 0) return false; break;
+                    case OP_NE: if (cmp == 0) return false; break;
+                    case OP_LT: if (!(cmp < 0)) return false; break;
+                    case OP_GT: if (!(cmp > 0)) return false; break;
+                    case OP_LE: if (!(cmp <= 0)) return false; break;
+                    case OP_GE: if (!(cmp >= 0)) return false; break;
                 }
             }
             return true;
         };
+
+        // 在当前索引扫描范围内继续步进体体
         for (scan_->next(); !scan_->is_end(); scan_->next()) {
             Rid r = scan_->rid();
             if (fh_->is_record(r) && satisfy(r)) {
@@ -219,7 +197,9 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     std::unique_ptr<RmRecord> Next() override {
+        // 如果 B+ 树扫描器结束，则返回空体体
         if (is_end()) return nullptr;
+        // 否则返回当前 rid 指向的真实数据记录体体
         return fh_->get_record(rid_, context_);
     }
 
