@@ -9,6 +9,7 @@ MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
 #include "lock_manager.h"
+#include <optional>
 
 /**
  * 这里实现 Lab4 要求的两阶段封锁(2PL) + no-wait 死锁预防。
@@ -63,6 +64,62 @@ bool LockManager::lock_internal(Transaction *txn, const LockDataId &lock_data_id
     std::unique_lock<std::mutex> lk(latch_);
     auto &rq = lock_table_[lock_data_id];
 
+    // ========= 升级/包含关系判定小工具 =========
+    // 说明：同一事务可能在同一对象上先申请“弱锁”，后续又申请“强锁/组合锁”。
+    // - 行级：S -> X（UPDATE/DELETE 常见：扫描阶段先读后写）
+    // - 表级（多粒度）：IS/IX/S/SIX/X 之间存在升级与“组合”关系
+    //   例如：先写表（IX）后读表（S），等价于 SIX（S + IX）。
+    auto combine_mode = [&](LockMode cur, LockMode req) -> std::optional<LockMode> {
+        // 任何场景：已持有 X，后续任何请求都满足
+        if (cur == LockMode::EXLUCSIVE) return cur;
+        // 任何场景：请求 IS，总是被“当前已持有锁”蕴含
+        if (req == LockMode::INTENTION_SHARED) return cur;
+
+        // 行级只会出现 S/X（实验中 record 不使用 IS/IX/SIX）
+        if (lock_data_id.type_ == LockDataType::RECORD) {
+            if (cur == req) return cur;
+            if (cur == LockMode::SHARED && req == LockMode::EXLUCSIVE) return LockMode::EXLUCSIVE;
+            // 例如：cur==X 上面已提前 return；cur==S req==S 已处理；其它都视为不支持
+            return std::nullopt;
+        }
+
+        // ===== 表级：多粒度锁升级矩阵（覆盖本实验所需场景）=====
+        // 目标：保证“单事务先写后读/先读后写”不会因为锁升级缺失而错误 abort。
+        if (cur == req) return cur;
+
+        // IS -> S / IX / SIX / X（X 可视为最强）
+        if (cur == LockMode::INTENTION_SHARED) {
+            if (req == LockMode::SHARED) return LockMode::SHARED;
+            if (req == LockMode::INTENTION_EXCLUSIVE) return LockMode::INTENTION_EXCLUSIVE;  // 已有专门分支也没关系
+            if (req == LockMode::S_IX) return LockMode::S_IX;
+            if (req == LockMode::EXLUCSIVE) return LockMode::EXLUCSIVE;
+        }
+
+        // IX -> SIX / X
+        if (cur == LockMode::INTENTION_EXCLUSIVE) {
+            if (req == LockMode::SHARED) return LockMode::S_IX;      // 关键：IX + S => SIX
+            if (req == LockMode::S_IX) return LockMode::S_IX;
+            if (req == LockMode::EXLUCSIVE) return LockMode::EXLUCSIVE;
+            // req==IX：cur==req 已处理
+        }
+
+        // S -> SIX / X
+        if (cur == LockMode::SHARED) {
+            if (req == LockMode::INTENTION_EXCLUSIVE) return LockMode::S_IX; // 关键：S + IX => SIX
+            if (req == LockMode::S_IX) return LockMode::S_IX;
+            if (req == LockMode::EXLUCSIVE) return LockMode::EXLUCSIVE;
+        }
+
+        // SIX -> X
+        if (cur == LockMode::S_IX) {
+            if (req == LockMode::SHARED) return LockMode::S_IX;
+            if (req == LockMode::INTENTION_EXCLUSIVE) return LockMode::S_IX;
+            if (req == LockMode::EXLUCSIVE) return LockMode::EXLUCSIVE;
+        }
+
+        return std::nullopt;
+    };
+
     // 1) 重入/升级：查找该事务是否已经在队列中
     for (auto it = rq.request_queue_.begin(); it != rq.request_queue_.end(); ++it) {
         if (it->txn_id_ != txn->get_transaction_id()) continue;
@@ -72,45 +129,26 @@ bool LockManager::lock_internal(Transaction *txn, const LockDataId &lock_data_id
             throw TransactionAbortException(txn->get_transaction_id(), AbortReason::DEADLOCK_PREVENTION);
         }
 
-        // 已经持有同种锁
-        if (it->lock_mode_ == mode) return true;
-
-        // ========= “已持有更强/等价锁”判断（非常关键）=========
-        // 同一事务在执行过程中可能会对同一对象多次申请不同类型的锁，
-        // 其中很多是“弱锁请求”：
-        // - 先写（IX）后读（IS）：读时再申请 IS 不应该失败
-        // - 已有 X 再申请 S/IS/IX：都应该直接成功
-        //
-        // 如果这里不处理，会在单事务场景下错误 abort（commit_index_test 就会出现这种现象）。
         auto cur = it->lock_mode_;
-        if (cur == LockMode::EXLUCSIVE) return true;
-        if (mode == LockMode::INTENTION_SHARED) return true;  // 任何已持有锁都蕴含 IS 语义
-        if (mode == LockMode::SHARED && (cur == LockMode::SHARED || cur == LockMode::S_IX)) return true;
-        if (mode == LockMode::INTENTION_EXCLUSIVE && (cur == LockMode::INTENTION_EXCLUSIVE || cur == LockMode::S_IX)) return true;
-        if (mode == LockMode::S_IX && cur == LockMode::S_IX) return true;
+        auto new_mode_opt = combine_mode(cur, mode);
+        if (!new_mode_opt.has_value()) {
+            // 不支持的升级（例如 record 上出现 IX/SIX），或升级关系未定义
+            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::UPGRADE_CONFLICT);
+        }
 
-        // 典型升级：S -> X（用于 UPDATE/DELETE 在扫描阶段先读后写）
-        if (it->lock_mode_ == LockMode::SHARED && mode == LockMode::EXLUCSIVE) {
-            if (!compatible_with_granted(rq, txn->get_transaction_id(), LockMode::EXLUCSIVE)) {
-                throw TransactionAbortException(txn->get_transaction_id(), AbortReason::UPGRADE_CONFLICT);
-            }
-            it->lock_mode_ = LockMode::EXLUCSIVE;
+        LockMode new_mode = new_mode_opt.value();
+        if (new_mode == cur) {
+            // 当前锁已经“蕴含/覆盖”请求锁
             return true;
         }
 
-        // 表级意向锁升级：IS -> IX
-        // 解释：先读后写时，我们会先拿 IS（读表中的一些行），后续写入时需要 IX。
-        // 如果不支持这个升级，会把“正常的读后写”误判为升级冲突，导致事务被错误 abort（dirty_write_test 就会失败）。
-        if (it->lock_mode_ == LockMode::INTENTION_SHARED && mode == LockMode::INTENTION_EXCLUSIVE) {
-            if (!compatible_with_granted(rq, txn->get_transaction_id(), LockMode::INTENTION_EXCLUSIVE)) {
-                throw TransactionAbortException(txn->get_transaction_id(), AbortReason::UPGRADE_CONFLICT);
-            }
-            it->lock_mode_ = LockMode::INTENTION_EXCLUSIVE;
-            return true;
+        // 升级需要与“其它事务已授予锁”相容，否则 no-wait 直接 abort
+        if (!compatible_with_granted(rq, txn->get_transaction_id(), new_mode)) {
+            throw TransactionAbortException(txn->get_transaction_id(), AbortReason::UPGRADE_CONFLICT);
         }
 
-        // 其它升级在本实验基础测试中很少用到，保守回滚
-        throw TransactionAbortException(txn->get_transaction_id(), AbortReason::UPGRADE_CONFLICT);
+        it->lock_mode_ = new_mode;
+        return true;
     }
 
     // 2) 新请求：检查与其他已授予锁相容性
