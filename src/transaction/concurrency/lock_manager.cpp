@@ -75,8 +75,19 @@ bool LockManager::lock_internal(Transaction *txn, const LockDataId &lock_data_id
         // 已经持有同种锁
         if (it->lock_mode_ == mode) return true;
 
-        // 已经持有更强锁（X），再请求任何弱锁都 ok
-        if (it->lock_mode_ == LockMode::EXLUCSIVE) return true;
+        // ========= “已持有更强/等价锁”判断（非常关键）=========
+        // 同一事务在执行过程中可能会对同一对象多次申请不同类型的锁，
+        // 其中很多是“弱锁请求”：
+        // - 先写（IX）后读（IS）：读时再申请 IS 不应该失败
+        // - 已有 X 再申请 S/IS/IX：都应该直接成功
+        //
+        // 如果这里不处理，会在单事务场景下错误 abort（commit_index_test 就会出现这种现象）。
+        auto cur = it->lock_mode_;
+        if (cur == LockMode::EXLUCSIVE) return true;
+        if (mode == LockMode::INTENTION_SHARED) return true;  // 任何已持有锁都蕴含 IS 语义
+        if (mode == LockMode::SHARED && (cur == LockMode::SHARED || cur == LockMode::S_IX)) return true;
+        if (mode == LockMode::INTENTION_EXCLUSIVE && (cur == LockMode::INTENTION_EXCLUSIVE || cur == LockMode::S_IX)) return true;
+        if (mode == LockMode::S_IX && cur == LockMode::S_IX) return true;
 
         // 典型升级：S -> X（用于 UPDATE/DELETE 在扫描阶段先读后写）
         if (it->lock_mode_ == LockMode::SHARED && mode == LockMode::EXLUCSIVE) {
