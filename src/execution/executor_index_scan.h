@@ -76,6 +76,13 @@ class IndexScanExecutor : public AbstractExecutor {
     }
 
     void beginTuple() override {
+        // ========== 并发控制：防止幻读（保守版：表级 S 锁）==========
+        // 即便是索引扫描，本质上仍是“扫描表的一段范围”，同样可能出现幻读（别的事务插入新记录）。
+        // 这里采取最简单的办法：扫描前对表加 S 锁。
+        if (context_ != nullptr && context_->txn_ != nullptr && context_->lock_mgr_ != nullptr) {
+            context_->lock_mgr_->lock_shared_on_table(context_->txn_, fh_->GetFd());
+        }
+
         // 1. 获取索引句柄体体。通过 sm_manager 查找预先打开的 B+ 树句柄体体。
         auto ih = sm_manager_->ihs_.at(sm_manager_->get_ix_manager()->get_index_name(tab_name_, index_col_names_)).get();
         

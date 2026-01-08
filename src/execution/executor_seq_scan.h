@@ -61,6 +61,15 @@ class SeqScanExecutor : public AbstractExecutor {
      *
      */
     void beginTuple() override {
+        // ========== 并发控制：防止幻读（保守版：表级 S 锁）==========
+        // 解释：
+        // - 记录级 S 锁只能保护“已有记录”，无法阻止其他事务插入“新记录”导致第二次扫描出现幻读。
+        // - 最简单的规避幻读办法：在扫描开始时对整张表加 S 锁（与插入/更新/删除的 IX/X 冲突）。
+        // - 这会降低并发度，但能通过 Lab4 bonus 的幻读测试（文档也允许用表锁获得折半分）。
+        if (context_ != nullptr && context_->txn_ != nullptr && context_->lock_mgr_ != nullptr) {
+            context_->lock_mgr_->lock_shared_on_table(context_->txn_, fh_->GetFd());
+        }
+
         // 1. 初始化扫描器体体。RmScan 是底层记录层的迭代器，用于遍历表中的所有记录。
         scan_ = std::make_unique<RmScan>(fh_);
 
