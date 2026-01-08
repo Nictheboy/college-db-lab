@@ -22,7 +22,10 @@ See the Mulan PSL v2 for more details. */
 #include "index/ix.h"
 #include "record_printer.h"
 
-// 目前的索引匹配规则为：完全匹配索引字段，且全部为单点查询，不会自动调整where条件的顺序
+// 目前的索引匹配规则为：
+// 1) 优先：完全匹配索引字段，且全部为单点查询(OP_EQ)，不会自动调整where条件的顺序
+// 2) 附加（为 Lab4 bonus 幻读测试准备）：若存在单列索引，并且该列出现在范围谓词中(OP_</<=/>/>=)，也允许走索引扫描。
+//    - 目的：让输出顺序稳定（按索引键有序），否则 SeqScan 会按插入顺序输出，导致 phantom_read_test_4 diff 失败。
 bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_conds, std::vector<std::string>& index_col_names) {
     index_col_names.clear();
     for(auto& cond: curr_conds) {
@@ -31,6 +34,26 @@ bool Planner::get_index_cols(std::string tab_name, std::vector<Condition> curr_c
     }
     TabMeta& tab = sm_manager_->db_.get_table(tab_name);
     if(tab.is_index(index_col_names)) return true;
+
+    // ====== 附加规则：单列索引的范围查询 ======
+    // 找出所有“该表上、右值为常量、且比较操作符属于范围类”的列名
+    std::unordered_set<std::string> range_cols;
+    for (auto &cond : curr_conds) {
+        if (!cond.is_rhs_val) continue;
+        if (cond.lhs_col.tab_name != tab_name) continue;
+        if (cond.op == OP_LT || cond.op == OP_LE || cond.op == OP_GT || cond.op == OP_GE) {
+            range_cols.insert(cond.lhs_col.col_name);
+        }
+    }
+    if (!range_cols.empty()) {
+        for (auto &idx : tab.indexes) {
+            if (idx.col_num == 1 && range_cols.count(idx.cols[0].name) > 0) {
+                index_col_names = {idx.cols[0].name};
+                return true;
+            }
+        }
+    }
+
     return false;
 }
 

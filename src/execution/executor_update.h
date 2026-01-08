@@ -56,6 +56,14 @@ class UpdateExecutor : public AbstractExecutor {
 
         // 2. 逐条处理待更新记录体体
         for (auto &rid : rids_) {
+            // ========== 并发控制（关键点：先加锁，再改索引/数据）==========
+            // 与 DELETE 同理：UPDATE 可能需要“删旧索引键 + 写新索引键 + 更新记录”。
+            // 必须先拿到 IX(表) + X(行)，否则一旦在维护索引过程中触发 abort，会导致索引/数据不一致。
+            if (context_ != nullptr && context_->txn_ != nullptr && context_->lock_mgr_ != nullptr) {
+                context_->lock_mgr_->lock_IX_on_table(context_->txn_, fh_->GetFd());
+                context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd());
+            }
+
             // 获取更新前的原始记录体体
             auto rec = fh_->get_record(rid, context_);
 

@@ -40,6 +40,17 @@ class DeleteExecutor : public AbstractExecutor {
         // 1. 迭代执行计划中提供的所有待删除记录的 RID 集合体体。
         // 这些 RID 通常由底层的扫描算子预先收集。
         for (auto &rid : rids_) {
+            // ========== 并发控制（关键点：先加锁，再改索引/数据）==========
+            // 解释（答辩高频点）：
+            // - DELETE 既会修改“表记录”，也会修改“索引”。
+            // - 如果我们先改索引、后加锁/后删记录，一旦后续因为锁冲突触发 abort，会出现：
+            //   “数据没删成功，但索引项先被删了” -> 之后走索引扫描会‘看不见’这条记录（phantom_read_test_4 正是这样）。
+            // - 因此必须把冲突检测放在最前面：先拿到 IX(表) + X(行)，保证后续操作不会再因为锁冲突中途回滚。
+            if (context_ != nullptr && context_->txn_ != nullptr && context_->lock_mgr_ != nullptr) {
+                context_->lock_mgr_->lock_IX_on_table(context_->txn_, fh_->GetFd());
+                context_->lock_mgr_->lock_exclusive_on_record(context_->txn_, rid, fh_->GetFd());
+            }
+
             // 2. 获取旧记录内容体体。
             // 必须在物理删除前拉取数据，因为我们需要旧数据来构造索引的 Key。
             auto rec = fh_->get_record(rid, context_);
