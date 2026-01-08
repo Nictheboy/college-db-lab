@@ -64,4 +64,16 @@ public:
 private:
     std::mutex latch_;      // 用于锁表的并发
     std::unordered_map<LockDataId, LockRequestQueue> lock_table_;   // 全局锁表
+
+    /**
+     * @brief 内部通用加锁逻辑（2PL + no-wait）
+     *
+     * 设计要点：
+     * - 只在 member function 内实现/调用，便于访问 LockMode/LockRequestQueue 等私有结构体；
+     * - no-wait：冲突直接抛 TransactionAbortException（rmdb.cpp 会捕获并触发回滚、输出 abort）。
+     */
+    bool lock_internal(Transaction *txn, const LockDataId &lock_data_id, LockMode mode);
+
+    /** @brief 判断 requested 是否与“队列里其他事务已授予的锁”相容 */
+    bool compatible_with_granted(const LockRequestQueue &rq, txn_id_t self, LockMode requested) const;
 };

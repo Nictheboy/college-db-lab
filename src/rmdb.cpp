@@ -149,6 +149,10 @@ void *client_handler(void *sock_fd) {
 
                     // 回滚事务
                     txn_manager->abort(context->txn_, log_manager.get());
+                    // 重要：abort 内部会销毁事务对象。这里必须清空 context->txn_，避免后续误用悬垂指针。
+                    context->txn_ = nullptr;
+                    // 同时清空该连接缓存的 txn_id，让下一条语句走 SetTransaction 创建新事务。
+                    txn_id = INVALID_TXN_ID;
                     std::cout << e.GetInfo() << std::endl;
 
                     std::fstream outfile;
@@ -187,6 +191,9 @@ void *client_handler(void *sock_fd) {
         // - 隐式事务（单条 SQL）：txn_mode_ == false，执行完一句就 commit，避免脏数据留在未提交状态。
         if (context->txn_ != nullptr && context->txn_->get_txn_mode() == false) {
             txn_manager->commit(context->txn_, context->log_mgr_);
+            // commit 会销毁事务对象，清空悬垂指针并重置 txn_id
+            context->txn_ = nullptr;
+            txn_id = INVALID_TXN_ID;
         }
     }
 

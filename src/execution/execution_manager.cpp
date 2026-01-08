@@ -105,18 +105,28 @@ void QlManager::run_cmd_utility(std::shared_ptr<Plan> plan, txn_id_t *txn_id, Co
             {
                 context->txn_ = txn_mgr_->get_transaction(*txn_id);
                 txn_mgr_->commit(context->txn_, context->log_mgr_);
+                // 重要：commit 内部会释放并销毁事务对象，为避免后续误用悬垂指针，
+                // 这里把 context->txn_ 和客户端缓存的 txn_id 一并清空。
+                context->txn_ = nullptr;
+                *txn_id = INVALID_TXN_ID;
                 break;
             }    
             case T_Transaction_rollback:
             {
                 context->txn_ = txn_mgr_->get_transaction(*txn_id);
                 txn_mgr_->abort(context->txn_, context->log_mgr_);
+                // abort 同样会销毁事务对象，必须清空
+                context->txn_ = nullptr;
+                *txn_id = INVALID_TXN_ID;
                 break;
             }    
             case T_Transaction_abort:
             {
                 context->txn_ = txn_mgr_->get_transaction(*txn_id);
                 txn_mgr_->abort(context->txn_, context->log_mgr_);
+                // abort 同样会销毁事务对象，必须清空
+                context->txn_ = nullptr;
+                *txn_id = INVALID_TXN_ID;
                 break;
             }     
             default:

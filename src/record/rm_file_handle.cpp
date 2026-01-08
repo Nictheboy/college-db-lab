@@ -37,6 +37,15 @@ std::unique_ptr<RmRecord> RmFileHandle::get_record(const Rid& rid, Context* cont
     // 1. 获取指定记录所在的page handle
     // 2. 初始化一个指向RmRecord的指针（赋值其内部的data和size）
     
+    // ========== 并发控制（Strict 2PL）==========
+    // 读记录需要持有：
+    // - 表级 IS（意向共享）：声明“我要读表中的某些行”，便于多粒度锁正确工作
+    // - 行级 S（共享锁）：防止其他事务在我提交前写该行，避免脏读/不可重复读
+    if (context != nullptr && context->txn_ != nullptr && context->lock_mgr_ != nullptr) {
+        context->lock_mgr_->lock_IS_on_table(context->txn_, fd_);
+        context->lock_mgr_->lock_shared_on_record(context->txn_, rid, fd_);
+    }
+
     // 1. 获取指定记录所在的page handle
     RmPageHandle page_handle = fetch_page_handle(rid.page_no);
     
@@ -73,6 +82,13 @@ Rid RmFileHandle::insert_record(char* buf, Context* context) {
     // 注意考虑插入一条记录后页面已满的情况，需要更新file_hdr_.first_free_page_no
     
     // 1. 获取当前未满的page handle
+    // ========== 并发控制（Strict 2PL）==========
+    // 插入属于写操作：只拿表级 IX（意向排他）即可表达“我要在表里写一些行”。
+    // 行级 X 对“新插入的记录”在本实验基础测试中不是必须，但表级 IX 是后续支持更强隔离（如幻读）的一块基础。
+    if (context != nullptr && context->txn_ != nullptr && context->lock_mgr_ != nullptr) {
+        context->lock_mgr_->lock_IX_on_table(context->txn_, fd_);
+    }
+
     RmPageHandle page_handle = create_page_handle();
     
     // 2. 在page handle中找到空闲slot位置
@@ -177,6 +193,13 @@ void RmFileHandle::delete_record(const Rid& rid, Context* context) {
     // 注意考虑删除一条记录后页面未满的情况，需要调用release_page_handle()
     
     // 1. 获取指定记录所在的page handle
+    // ========== 并发控制（Strict 2PL）==========
+    // 删除属于写操作：表 IX + 行 X
+    if (context != nullptr && context->txn_ != nullptr && context->lock_mgr_ != nullptr) {
+        context->lock_mgr_->lock_IX_on_table(context->txn_, fd_);
+        context->lock_mgr_->lock_exclusive_on_record(context->txn_, rid, fd_);
+    }
+
     RmPageHandle page_handle = fetch_page_handle(rid.page_no);
     
     // 检查该slot是否有记录
@@ -223,6 +246,14 @@ void RmFileHandle::update_record(const Rid& rid, char* buf, Context* context) {
     // 2. 更新记录
     
     // 1. 获取指定记录所在的page handle
+    // ========== 并发控制（Strict 2PL）==========
+    // 更新属于写操作：表 IX + 行 X
+    // 注意：如果该事务之前在扫描阶段对该行拿过 S 锁，这里会触发 S->X 升级。
+    if (context != nullptr && context->txn_ != nullptr && context->lock_mgr_ != nullptr) {
+        context->lock_mgr_->lock_IX_on_table(context->txn_, fd_);
+        context->lock_mgr_->lock_exclusive_on_record(context->txn_, rid, fd_);
+    }
+
     RmPageHandle page_handle = fetch_page_handle(rid.page_no);
     
     // 检查该slot是否有记录
