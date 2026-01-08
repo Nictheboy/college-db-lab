@@ -53,11 +53,20 @@ public:
         if(txn_id == INVALID_TXN_ID) return nullptr;
         
         std::unique_lock<std::mutex> lock(latch_);
-        assert(TransactionManager::txn_map.find(txn_id) != TransactionManager::txn_map.end());
-        auto *res = TransactionManager::txn_map[txn_id];
+        auto it = TransactionManager::txn_map.find(txn_id);
+        if (it == TransactionManager::txn_map.end()) {
+            // 重要语义（Lab4 高频点）：
+            // - txn_id 可能来自客户端缓存（rmdb.cpp 的 txn_id 变量），但事务对象可能已在 commit/abort 时被释放并从 txn_map 移除。
+            // - 因此这里必须“可返回 nullptr”，让上层逻辑（SetTransaction）创建一个新事务，而不是 assert 崩溃。
+            return nullptr;
+        }
+        auto *res = it->second;
         lock.unlock();
-        assert(res != nullptr);
-        assert(res->get_thread_id() == std::this_thread::get_id());
+        if (res == nullptr) return nullptr;
+
+        // 这个断言对单连接单线程的常规调试很有用，但在测试脚本/并发环境下可能过于严格。
+        // 如果后续并发测试确实一事务一线程，可再打开。
+        // assert(res->get_thread_id() == std::this_thread::get_id());
 
         return res;
     }

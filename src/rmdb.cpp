@@ -119,7 +119,8 @@ void *client_handler(void *sock_fd) {
         Context *context = new Context(lock_manager.get(), log_manager.get(), nullptr, data_send, &offset);
         // Lab 3 need to remove transaction part
         // Lab 4 need to restart transaction
-        // SetTransaction(&txn_id, context);
+        // Lab4 要求：为每个客户端请求绑定一个 Transaction 对象（隐式事务/显式事务都基于它）
+        SetTransaction(&txn_id, context);
 
         // 用于判断是否已经调用了yy_delete_buffer来删除buf
         bool finish_analyze = false;
@@ -181,10 +182,12 @@ void *client_handler(void *sock_fd) {
             break;
         }
         // 如果是单条语句，需要按照一个完整的事务来执行，所以执行完当前语句后，自动提交事务
-        // if(context->txn_->get_txn_mode() == false)
-        // {
-        //     txn_manager->commit(context->txn_, context->log_mgr_);
-        // }
+        // 关键语义：
+        // - 显式事务（begin; ... commit/abort;）：txn_mode_ == true，由用户手动结束，不在这里自动提交。
+        // - 隐式事务（单条 SQL）：txn_mode_ == false，执行完一句就 commit，避免脏数据留在未提交状态。
+        if (context->txn_ != nullptr && context->txn_->get_txn_mode() == false) {
+            txn_manager->commit(context->txn_, context->log_mgr_);
+        }
     }
 
     // Clear
